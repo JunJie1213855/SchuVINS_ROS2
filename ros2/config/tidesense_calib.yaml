@@ -1,0 +1,119 @@
+# Converted from measured TideSense calibration; do not flip or swap images.
+# Source SHA256: 1f4939d2c68bb6ee112195fa2194b8350adeda54e78d7484a5ad038bc7be9ef1
+# cam0=physical right; cam1=physical left; driver corrects IMU intrinsics once.
+# delay_imu_cam is applied once by the ROS 2 adapter; no further bag/driver time shift.
+label: TideSense_OV9281_SC7U22
+cameras:
+- camera:
+    label: cam0_right
+    type: pinhole
+    image_width: 640
+    image_height: 400
+    intrinsics:
+      rows: 4
+      cols: 1
+      data:
+      - 335.2702628606069
+      - 334.9602562709377
+      - 260.19119318347754
+      - 203.26223550562855
+    distortion:
+      type: equidistant
+      parameters:
+        rows: 4
+        cols: 1
+        data:
+        - -0.030612070501337164
+        - 0.028852097824205124
+        - -0.04670199341807543
+        - 0.021176921256111977
+  T_B_C:
+    rows: 4
+    cols: 4
+    data:
+    - 0.9998780176722543
+    - 0.00438699421577768
+    - -0.014990132005880803
+    - -0.035409833976360064
+    - -0.004385518133258942
+    - 0.9999903749438518
+    - 0.0001313406154517682
+    - -0.0019649818539857027
+    - 0.014990563915538862
+    - -6.558509848603232e-05
+    - 0.9998876330328768
+    - 0.015572055971457159
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+- camera:
+    label: cam1_left
+    type: pinhole
+    image_width: 640
+    image_height: 400
+    intrinsics:
+      rows: 4
+      cols: 1
+      data:
+      - 334.905273099387
+      - 334.681954658993
+      - 352.70374775597935
+      - 193.45147434351264
+    distortion:
+      type: equidistant
+      parameters:
+        rows: 4
+        cols: 1
+        data:
+        - -0.021397953513419436
+        - 0.008700929157928312
+        - -0.04667479862304332
+        - 0.04870215768076516
+  T_B_C:
+    rows: 4
+    cols: 4
+    data:
+    - 0.9998020928201551
+    - 0.004540237737270876
+    - -0.019369084483449373
+    - 0.014404235512844409
+    - -0.004474620685637893
+    - 0.9999841072834429
+    - 0.003429715768912945
+    - -0.002193877504820338
+    - 0.01938434838104184
+    - -0.003342367697445939
+    - 0.9998065190905776
+    - 0.015928740506548723
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+imu_params:
+  delay_imu_cam: 0.008147591034761545
+  max_imu_delta_t: 0.01
+  acc_max: 150.0
+  omega_max: 7.8
+  sigma_omega_c: 0.001518119556117008
+  sigma_acc_c: 0.025541755466331757
+  sigma_omega_bias_c: 8.652640205649434e-06
+  sigma_acc_bias_c: 0.0014885156668134488
+  g: 9.81
+  imu_rate: 204
+imu_initialization:
+  velocity:
+  - 0.0
+  - 0.0
+  - 0.0
+  omega_bias:
+  - 0.0
+  - 0.0
+  - 0.0
+  acc_bias:
+  - 0.0
+  - 0.0
+  - 0.0
+  velocity_sigma: 2.0
+  omega_bias_sigma: 0.01
+  acc_bias_sigma: 0.1
