@@ -1,140 +1,146 @@
-# SchurVINS for ROS 2 Humble
+# ROS 2 Humble 详细说明
 
-Native ROS 2 package `schurvins`, targeting Ubuntu 22.04 / ROS 2 Humble with C++17, OpenCV 4 and Eigen 3.4. The original algorithm, camera models and licenses are retained.
+安装、快速启动与话题总览见 [README.md](README.md)。本文件补充构建方式、标定约定、可视化语义和排查说明。原 ROS 1 文档见 [README_ROS1.md](README_ROS1.md)。
 
-## Supported scope
+## 构建结构与离线依赖
 
-- EuRoC-style **stereo + IMU** SchurVINS pipeline.
-- Native `rclcpp`, ROS 2 parameters, exact-time stereo synchronization, sensor-data QoS, Python launch, RViz2.
-- Timestamped world-to-IMU pose in `nav_msgs/Odometry`, bounded `nav_msgs/Path`, TF and optional TUM trajectory file.
-- Image pairs are buffered until the IMU stream covers their timestamp. Processing and IMU insertion are serialized to avoid frontend/filter races.
-- Invalid image dimensions/conversions and non-increasing sensor timestamps are dropped. Restart the node after rewinding or looping a bag.
+仓库根目录是单个 `ament_cmake` 包 `schurvins`，C++17。原 ROS 1 子包的 CMake/package.xml 保留为参考，ROS 2 构建不使用这些 Catkin 入口。CPU 视觉前端、相机模型、SchurVINS 滤波器和 ROS 2 wrapper 由根目录 CMake 直接构建。
 
-The original ROS 1 subpackages remain in the repository as reference. The repository-root manifest is the single ROS 2 package; colcon does not traverse into those nested Catkin packages. The ROS 2 build excludes ROS 1 nodes/nodelets, rqt, legacy benchmarking scripts, Ceres/GTSAM backend, loop closure and global mapping. Attempts to enable `use_ceres_backend`, `runlc` or `use_global_map` fail explicitly. Monocular/array launch and full legacy visualization/message parity are not implemented.
-
-## Dependencies and build
+首次配置通过 [Dependencies.cmake](cmake/Dependencies.cmake) 下载固定 revision 的 FAST、minkindr、OpenGV。离线构建可提供对应源码目录：
 
 ```bash
 source /opt/ros/humble/setup.bash
-sudo apt-get install python3-colcon-common-extensions git \
-  libeigen3-dev libboost-dev libopencv-dev libyaml-cpp-dev libgoogle-glog-dev libgflags-dev \
-  ros-humble-cv-bridge ros-humble-message-filters ros-humble-tf2-ros \
-  ros-humble-nav-msgs ros-humble-sensor-msgs ros-humble-std-msgs \
-  ros-humble-geometry-msgs ros-humble-launch-ros ros-humble-rviz2
-cd /home/ros/ros_ws/schurvins_ws
-MAKEFLAGS='-j2 -l2' colcon build --packages-select schurvins \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
-source install/setup.bash
+cd "$SCHURVINS_WS"
+MAKEFLAGS='-j2' colcon build --packages-select schurvins --cmake-args \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFETCHCONTENT_SOURCE_DIR_FAST=/path/to/fast \
+  -DFETCHCONTENT_SOURCE_DIR_MINKINDR=/path/to/minkindr \
+  -DFETCHCONTENT_SOURCE_DIR_OPENGV_SRC=/path/to/opengv
 ```
 
-On the first configure, CMake downloads FAST, minkindr and OpenGV at fixed Git revisions (see `cmake/Dependencies.cmake`). Their old Catkin build files are not used. A network connection to GitHub is required unless source directories are supplied explicitly:
+这些目录应对应 CMake 中固定的版本。位于工作空间内的依赖源码应放在 `src` 之外，并在其父目录加入 `COLCON_IGNORE`，避免被 colcon 当作旧 ROS 1 包扫描。
+
+切换编译器或依赖位置时使用新的 build/install 目录。如果其他 SDK 覆盖了 Eigen，可通过 `-DEigen3_DIR=/usr/share/eigen3/cmake` 选择 Ubuntu Eigen。OpenGV 和滤波器的 Eigen 模板编译占用较多内存，建议限制构建并行度。
+
+默认启用测试目标。仅构建节点时可在 `--cmake-args` 后加入 `-DBUILD_TESTING=OFF`。已完成的本机验证使用 GCC 12、Eigen 3.4、OpenCV 4.5.4，Release 编译时使用 `-O2 -DNDEBUG`。
+
+## 参数与标定约定
+
+- `calib_file` 使用 SVO camera-bundle YAML：两组相机内参/畸变、`T_B_C`、IMU 噪声和初始化参数。
+- `T_B_C` 表示 camera → body/IMU 变换，不能直接填入方向相反的矩阵。
+- 参数文件使用 ROS 2 `ros__parameters` envelope；原来的 `T_world_imuinit/qx` 等斜杠键改成 `T_world_imuinit.qx`。
+- 参数在启动时读取，不支持运行时自动重配；修改后重启节点。
+- 适配器将输入转换为 MONO8，不执行双目校正；应使用与输入方向、尺寸和畸变模型一致的标定。
+- 两目使用 ExactTime 同步，时间戳必须完全一致。`sync_queue_size` 控制同步队列，`image_queue_size` 控制等待 IMU 的图像对队列，默认均为 30。
+- 图像/IMU 输入使用 Best Effort / Volatile，兼容传感器数据发布器及 Reliable 发布器。
+- 输入尺寸或图像转换失败时丢弃该帧；非递增时间戳也会被丢弃。回放倒带或循环需重启节点。
+
+适配器先将相机帧转到 IMU 时钟：
+
+```text
+t_frame_imu = t_camera - delay_imu_cam
+```
+
+然后将内部 IMU handler 的偏移置零，避免采样提取或旋转先验重复补偿。SchurVINS 前向积分使用修正后的帧时间，输出位姿、TF、轨迹和特征图也使用该时间。零偏移的 EuRoC 输入不改变帧时间。
+
+图像仅在 IMU 缓冲覆盖其时间、且存在更早的 IMU 样本时进入算法。ROS 回调采用单线程执行器串行处理图像和 IMU 插入；深度滤波器自身可运行工作线程。
+
+## 轨迹、坐标系与复位
+
+`world_frame` 默认 `world`，`body_frame` 默认 `imu`；两者必须非空且不同。修改后也需同步 RViz 的 Fixed Frame 和 Target Frame。
+
+`trajectory_file` 可保存 TUM 格式：
+
+```text
+timestamp tx ty tz qx qy qz qw
+```
+
+父目录需预先存在，文件在正常退出时刷新。`path_max_poses` 默认 10000，仅限制轨迹消息中的位姿数，不限制历史 landmarks 数量。
+
+发送远程命令示例：
 
 ```bash
-MAKEFLAGS='-j2 -l2' colcon build --packages-select schurvins --cmake-args \
-  -DFETCHCONTENT_SOURCE_DIR_FAST=/absolute/path/to/fast \
-  -DFETCHCONTENT_SOURCE_DIR_MINKINDR=/absolute/path/to/minkindr \
-  -DFETCHCONTENT_SOURCE_DIR_OPENGV_SRC=/absolute/path/to/opengv
+ros2 topic pub --once /svo/remote_key std_msgs/msg/String '{data: r}'
+ros2 topic pub --once /svo/remote_key std_msgs/msg/String '{data: s}'
 ```
 
-Use an empty build directory if switching compilers or dependency locations. If another installed SDK overrides Eigen, select Ubuntu's Eigen with `-DEigen3_DIR=/usr/share/eigen3/cmake`. Limit parallelism on machines with little free RAM; OpenGV and Eigen-heavy filter code require substantial compiler memory. Source-only dependencies under the workspace but outside `src` should have a `COLCON_IGNORE` marker in their parent directory.
+`r` 重建前端和滤波器并暂停处理图像，`s` 恢复处理，`q` 退出；`c`/`C` 启用/禁用仿射补偿。自动重新初始化同样重建滤波器，不仅重置前端地图。
 
-## Run
+当前 `Odometry` 只导出 pose；twist 为消息默认值，pose/twist 协方差对角线 `1e6` 是占位值。适配器未通过上游公共 API 获得真实速度和滤波器协方差。
+
+## 特征图
+
+默认 RViz 显示 `/svo/tracked_image`。拼接图保留 cam0、cam1 顺序，不翻转或交换图像；TideSense 的 cam0 是物理右目，因此在拼接图左半边。
+
+两目独立图像为 `/svo/cam0/tracked_image` 和 `/svo/cam1/tracked_image`，均为 BGR8，Reliable / Volatile / KeepLast(2)。只有存在订阅者时才发送图像。
+
+| 颜色 | 特征类别 |
+|---|---|
+| 绿色 | 地图点观测 |
+| 黄色 | 未收敛种子 |
+| 青色 | 已收敛种子 |
+| 红色 | 异常点 |
+| 蓝橙色 | 其他未关联地图点的特征 |
+
+短线连接同一地图点 ID 在相邻处理帧中的像素位置。图中分别标注两目的 landmark/seed 数量。类别颜色不代表统计置信度：原算法可能将未收敛种子提升为地图点。初始化阶段有前端帧时也可以发布特征图，不必等待完整跟踪成功。
+
+## 全部历史 XYZRGB 点云
+
+`/svo/landmarks` 使用 `sensor_msgs/msg/PointCloud2`，字段为 `x/y/z/rgb/id`；忽略额外 `id` 字段即可由 XYZRGB 消费者读取。
+
+- 从当前双目帧和局部关键帧中收集有限的已估计三维点，按 ID 去重。
+- 已有 ID 更新到最新有限坐标，离开局部地图后保留最后的坐标与颜色。
+- 不按数量、时间截断或降采样，内存及完整点云消息大小随历史点数增长。
+- 颜色来自未叠加标记的原图像素。当前输入为 MONO8，因此 `R=G=B=gray`；这不是伪彩色。
+- 更新的有效像素优先于旧关键帧观测；同一时间优先 cam0。无有效像素时保留旧颜色，尚无颜色的新点使用灰度 128。黑色像素 0 也是有效颜色。
+- 仅保存坐标与颜色数值，不持有已移除关键帧或算法点对象。未三角化的深度种子不会被虚构成三维点。
+- 手动复位、自动重新初始化或节点重启时清空历史，因为新的地图原点不能直接与旧坐标混合。
+
+发布器使用 Reliable / Transient Local / KeepLast(1)，每次发布完整快照，晚打开 RViz 也可收到全部历史点。RViz 配置为 Points、3 pixels、Position Transformer=`XYZ`、Color Transformer=`RGB8`、Decay Time=0，无需用 RViz 的消息累积来拼历史地图。
+
+可视化复制特征与地图点时，与深度滤波器工作线程的种子初始化/更新共享互斥锁。复制完成后释放锁，再绘图及发布，避免复制过程中读取被扩容的特征数组。
+
+## TideSense 标定与时间
+
+示例文件：[tidesense_calib.yaml](ros2/config/tidesense_calib.yaml)、[tidesense_stereo.yaml](ros2/config/tidesense_stereo.yaml)。联合设备入口由独立 TideDrive 项目提供，使用方法见 [主 README](README.md#tidesense-实时运行)。
+
+标定来自现有设备的 OpenVIO 配置：
+
+- 640×400 equidistant，cam0=物理右目，cam1=物理左目，保持驱动已处理的图像方向。
+- OpenVIO 的 `imu_from_camera` / `imu_from_camera1` 直接对应 SVO 的 `T_B_C`。
+- OpenVIO：`t_imu = t_cam + rig.clock_offset`；SVO：`t_imu = t_cam - delay_imu_cam`，两者符号相反。
+- 示例 `clock_offset=-0.008147591034761545` 转换为 `delay_imu_cam=+0.008147591034761545`，在适配器中只修正一次。
+- 驱动负责所有传感器共用的设备到主机时间平移；这不替代相机—IMU 标定偏移，也不等于跨主机精密时钟同步。
+- 驱动只做一次 IMU 比例/轴间校正，默认关闭陀螺加速度灵敏度 `A` 项。SchurVINS 读取相同标定的噪声、随机游走与重力，不重复做 IMU 内参校正。
+
+转换工具使用 Python/PyYAML，并核对相机 rig 配置与 IMU 文件的噪声参数一致：
 
 ```bash
-source /opt/ros/humble/setup.bash
-source /home/ros/ros_ws/schurvins_ws/install/setup.bash
-ros2 launch schurvins euroc_vio_stereo.launch.py rviz:=true
+cd "$SCHURVINS_WS/src/SchurVINS"
+python3 ros2/scripts/import_tidesense_calibration.py \
+  --source /path/to/openvio/config/tidesense_stereo.yaml \
+  --imu /path/to/TideDrive/ros2/src/tidesense_ros2/config/imu.yaml \
+  --output ros2/config/tidesense_calib.yaml
+
+cd "$SCHURVINS_WS"
+MAKEFLAGS='-j2' colcon build --packages-select schurvins
 ```
 
-For ROS 2 bag playback, use simulation time and publish `/clock`:
+输出文件记录源标定的 SHA256。提供的标定只适用于相应设备与图像约定。`acc_max`、`omega_max` 为满足旧读取器而保留的 SVO 默认值，当前 Schur 滤波器不使用它们，不能视为该设备的实测量程；初始速度/零偏先验同样为估计器默认值。
 
-```bash
-ros2 launch schurvins euroc_vio_stereo.launch.py use_sim_time:=true rviz:=true
-# In another sourced terminal:
-ros2 bag play /absolute/path/to/ros2_bag --clock
-```
+## 测试与实机排查
 
-The original EuRoC `.bag` examples are ROS 1 bags. Convert them to a ROS 2 bag or use a suitable bridge before playback; changing the launch command does not convert the bag format.
+本仓库的 3 项测试分别为历史点存储、EuRoC 合成集成测试、TideSense 鱼眼合成集成测试。测试命令见 [主 README](README.md#测试与验证边界)。
 
-Custom topics/calibration and trajectory output:
+测试覆盖历史 ID 保留、坐标/颜色更新、有限坐标过滤、特征叠加、时间戳与非零偏移、晚订阅、复位恢复、位姿/轨迹/TF 和正常退出。合成测试使用确定性纹理平面与静止 IMU，不代替真实轨迹精度评估。已完成的软件测试通过；实机连接过程中观察到过低匹配和深度未收敛问题，需要结合场景、图像质量与标定继续排查。
 
-```bash
-ros2 launch schurvins euroc_vio_stereo.launch.py \
-  calib_file:=/absolute/path/to/stereo_calibration.yaml \
-  cam0_topic:=/camera/left/image_raw cam1_topic:=/camera/right/image_raw \
-  imu_topic:=/imu/data trajectory_file:=/tmp/imu_trajectory.txt
-```
+| 日志/现象 | 含义与检查方向 |
+|---|---|
+| `Not enough matched features` | 匹配数低于 `quality_min_fts`，默认 40；结合特征图检查覆盖、模糊与纹理 |
+| `matches are unconverged seeds` | 匹配中未收敛深度种子占比较高，不等于整个地图都未收敛 |
+| `updated seeds are unconverged` | 本次被提升为地图点的种子中未收敛点的比例 |
+| `obs is from too far away` | 新旧观测方向不相容；日志数值为方向余弦，不是米数，位姿/点深度错误也会触发 |
+| `Downsizing storage not implemented` | 申请容量小于已有容量时保留原存储并打印日志，该分支没有中止程序 |
+| 图像队列满/缺少 IMU | 检查话题、时间戳、偏移和处理/回放速率 |
 
-The calibration retains the upstream camera-bundle YAML schema, including `T_B_C`, `imu_params` and `imu_initialization`. The images must match calibrated dimensions and have **identical timestamps** within each stereo pair. Input QoS is best-effort/volatile, compatible with sensor-data publishers and reliable bag publishers. No stereo rectification is applied by the adapter; use intrinsics/distortion corresponding to the supplied images.
-
-Algorithm parameters are in `ros2/config/euroc_stereo.yaml`, using the ROS 2 `ros__parameters` envelope. Override with `params_file:=/absolute/path/to/params.yaml`. ROS 1 parameter keys such as `T_world_imuinit/qx` use ROS 2 dot notation, e.g. `T_world_imuinit.qx`. Parameters are read at startup; restart to apply changes.
-
-| Topic | Type | Meaning |
-|---|---|---|
-| `/cam0/image_raw`, `/cam1/image_raw` | `sensor_msgs/msg/Image` | Default stereo inputs |
-| `/imu0` | `sensor_msgs/msg/Imu` | Default angular velocity / acceleration input |
-| `/svo/odometry` | `nav_msgs/msg/Odometry` | IMU/body pose in `world` |
-| `/svo/path` | `nav_msgs/msg/Path` | At most `path_max_poses` poses (default 10000) |
-| `/svo/tracked_image` | `sensor_msgs/msg/Image` | BGR stereo feature overlay, cam0 followed by cam1 |
-| `/svo/cam0/tracked_image`, `/svo/cam1/tracked_image` | `sensor_msgs/msg/Image` | Per-camera feature overlays |
-| `/svo/landmarks` | `sensor_msgs/msg/PointCloud2` | All historical XYZ/RGB points with unique `id`, in `world` |
-| `/tf` | `tf2_msgs/msg/TFMessage` | `world` → `imu`, unless `publish_tf=false` |
-| `/svo/remote_key` | `std_msgs/msg/String` | `r` reset/pause, `s` start, `q` quit, `c`/`C` enable/disable compensation |
-
-`world_frame` and `body_frame` can be changed in the parameter file; adjust RViz's fixed frame accordingly. Odometry twist and estimator covariance are not exposed by the upstream public API. The adapter publishes pose only, leaves twist at its message default and sets covariance diagonal entries to `1e6` as an explicit placeholder. Do not use these covariance/twist fields as calibrated filter output. A trajectory file contains `timestamp tx ty tz qx qy qz qw` and is flushed on orderly shutdown. Create its parent directory first.
-
-## Verification
-
-```bash
-sudo apt-get install ros-humble-ament-cmake-test python3-opencv python3-numpy python3-yaml
-colcon test --packages-select schurvins --event-handlers console_direct+
-colcon test-result --verbose
-```
-
-The integration test runs the native executable in an isolated ROS domain with a deterministic textured stereo plane projected through the supplied EuRoC calibration and stationary IMU measurements. It checks delayed-IMU buffering, visual tracking, finite normalized poses, increasing output timestamps, path/TF publication, invalid dimensions, duplicate timestamps, filter reset/start, trajectory-file output and clean shutdown. This verifies software integration, not real-world VIO accuracy or equivalence to the paper's results. Validate on real EuRoC/TUM-VI sequences before relying on estimated trajectories.
-
-Local verification: the package was built in this workspace with GCC 12, Eigen 3.4 and OpenCV 4.5.4 (`Release`, `-O2 -DNDEBUG`). The synthetic integration test and installed launch startup/shutdown with `use_sim_time=true` passed. No real dataset trajectory accuracy evaluation has been run for this port.
-
-## TideSense / TideDrive
-
-已接入 `/home/ros/lib/tideSense/TideDrive` 的实时双目 + IMU 驱动，参考其 `scripts/openvio.sh`。直接运行：
-
-```bash
-/home/ros/lib/tideSense/TideDrive/scripts/schurvins.sh
-# 无 RViz：末尾加 rviz:=false
-# 记录轨迹：末尾加 trajectory_file:=/tmp/tidesense_schurvins.txt
-```
-
-脚本启动驱动、SchurVINS 和可选 RViz；先停止其他占用设备的采集。默认使用设备密码 `tidesense`，不再询问。设置 `TIDESENSE_PASSWORD` 可覆盖；显式设为空则使用已有 SSH 密钥。`SCHURVINS_WS` 可覆盖工作空间路径。
-
-- `ros2/config/tidesense_calib.yaml`：实测 640×400 equidistant 双目标定、IMU 噪声与 204 Hz 频率。cam0 为物理右目，cam1 为物理左目，图像方向由驱动处理一次。标定从现有 OpenVIO 文件转换，原文件未修改。
-- `ros2/config/tidesense_stereo.yaml`：SchurVINS 参数；鱼眼使用球面极线搜索和前端位姿残差。
-- SchurVINS 的 `delay_imu_cam` 与 OpenVIO `rig.clock_offset` 符号相反。图像进入滤波器前使用 `t_imu = t_cam - delay_imu_cam` 修正时间戳，IMU handler 内部偏移随后置零。TideSense 修正为 -8.147591 ms；输出里程计、TF、轨迹也使用这个 IMU 时钟时间。
-- IMU 内参校正只由 TideDrive 做一次；默认保留比例/轴间修正，关闭 gyro acceleration sensitivity `A`，与其 OpenVIO 启动脚本一致。SchurVINS 重力使用标定值。
-
-重建转换后的标定：
-
-```bash
-python3 /home/ros/ros_ws/schurvins_ws/src/SchurVINS/ros2/scripts/import_tidesense_calibration.py   --source /home/ros/ros_ws/openvio/config/tidesense_stereo.yaml   --imu /home/ros/lib/tideSense/TideDrive/ros2/src/tidesense_ros2/config/imu.yaml   --output /home/ros/ros_ws/schurvins_ws/src/SchurVINS/ros2/config/tidesense_calib.yaml
-# 重新 colcon build 安装更新后的配置。
-```
-
-`acc_max`、`omega_max` 保留 SVO 的通用默认值以满足旧标定读取器，当前 Schur 滤波器不使用它们；这些字段不是该设备的实测量程。初始速度/零偏先验同样为估计器默认值。
-
-新增 `ros2_tidesense_imu_smoke` 测试以实测鱼眼内外参投影合成场景，验证非零时间偏移仅应用一次，并在复位前后共得到 42 个有限位姿。EuRoC 回归测试同时通过。联合 launch、有/无 RViz 开关和驱动现有测试共 11 项通过；本次尚未进行设备采集或真实轨迹精度评估。
-
-## Feature and landmark visualization
-
-The bundled RViz configurations now include **Stereo feature tracks (cam0 | cam1)** and **All historical landmarks (XYZRGB)**. Restart the combined TideDrive script after rebuilding so both the executable and RViz config are reloaded.
-
-Image colors: green = landmark observation; yellow = unconverged seed; cyan = converged seed; red = outlier; blue/orange = other feature without an associated landmark. A line connects observations with the same landmark ID in adjacent processed frames. The overlay labels report landmark/seed counts independently for cam0 and cam1. Colors describe feature categories, not statistical confidence; the original algorithm can promote unconverged seeds to landmarks. Annotated images are published during initialization as well as tracking when frontend frames are available. The stereo composite preserves topic order; TideSense cam0 on its left is the physical right camera.
-
-`/svo/landmarks` accumulates every finite estimated landmark seen in the current stereo bundle or retained local keyframes, keyed by point ID. Points remain after leaving the local map; their last finite position/color is retained. Existing IDs receive updated coordinates and the latest valid original-image color. Older keyframe observations do not overwrite newer colors; cam0 is preferred when timestamps tie. Only plain coordinate/color values are stored, so discarded keyframes and estimator points can still be freed. There is no count cap, downsampling or age-based expiry; memory and cloud size grow with historical point count.
-
-The PointCloud2 fields are `x`, `y`, `z`, packed `rgb` and `id` (compatible with XYZRGB consumers that ignore the extra ID field). TideSense publishes MONO8: each point's unannotated source pixel is encoded as `R=G=B=gray`, not an artificial label color. A point without a valid pixel keeps its prior color; a never-colored point uses neutral gray 128. RViz uses 3-pixel Points with RGB8 color and Decay Time=0. The publisher is Reliable / Transient Local / KeepLast(1), so a late RViz subscriber receives the complete historical snapshot. RViz does not need to accumulate old messages itself. Untriangulated seeds are not fabricated into 3D points.
-
-History spans one estimator/map coordinate frame. Manual reset, automatic reinitialization or node restart clears it and publishes an empty cloud; retaining pre-reset points under a new origin would mix incompatible coordinates. Adjacent-frame image tracks are also cleared on reset.
-
-Visualization snapshots share the depth-filter worker's mutex for seed-array initialization/updates, then release it before drawing or publishing. The image publishers use Reliable / Volatile / KeepLast(2) and only send images with connected subscribers. Coordinates and images use the same corrected timestamps as the estimator.
-
-Both EuRoC and TideSense integration tests check colored stereo/per-camera overlays, image dimensions/timestamps, historical ID retention, coordinate/color updates, actual grayscale RGB, finite unique landmark IDs, late-subscriber cloud delivery and reset/recovery, in addition to pose/TF checks. No new real-device accuracy claim is made by adding visualization.
+不应仅通过降低质量阈值掩盖持续退化。当前分支未完成实机精度评估；原论文和原 ROS 1 上游的复现说明见 [历史文档](README_ROS1.md)。
